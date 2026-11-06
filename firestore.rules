@@ -1,0 +1,69 @@
+rules_version = '2';
+// IronForge Chess — Firestore security rules.
+// Paste into Firebase console → Firestore Database → Rules, then Publish.
+//
+// !!! Replace OWNER_EMAIL_HERE below with the Google/email address YOU sign in with.
+// Only that verified email can claim the username "Dorian" (the moderator account).
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function userDoc(uid) { return /databases/$(database)/documents/users/$(uid); }
+    function isAdmin() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/usernames/dorian)
+        && get(/databases/$(database)/documents/usernames/dorian).data.uid == request.auth.uid;
+    }
+    function notLocked() {
+      return signedIn() && exists(userDoc(request.auth.uid)) && get(userDoc(request.auth.uid)).data.locked != true;
+    }
+
+    // usernames/{lowercase name} -> { uid }   (guarantees unique names)
+    match /usernames/{name} {
+      allow read: if true;
+      allow create: if signedIn()
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.keys().hasOnly(['uid'])
+        && name.matches('^[a-z0-9_]{3,20}$')
+        && !exists(userDoc(request.auth.uid))
+        && (name != 'dorian'
+            || (request.auth.token.email == 'OWNER_EMAIL_HERE' && request.auth.token.email_verified == true));
+      allow update, delete: if false;
+    }
+
+    match /users/{uid} {
+      allow read: if true;
+      allow create: if signedIn() && request.auth.uid == uid
+        && request.resource.data.uid == uid
+        && request.resource.data.locked == false
+        && getAfter(/databases/$(database)/documents/usernames/$(request.resource.data.usernameLower)).data.uid == uid
+        && request.resource.data.keys().hasOnly(['uid','username','usernameLower','avatar','frame','bio','locked','lockReason','createdAt','provider','stats']);
+      // owner may edit their own profile, but never lock fields or their name
+      allow update: if (signedIn() && request.auth.uid == uid && resource.data.locked != true
+          && !request.resource.data.diff(resource.data).affectedKeys()
+               .hasAny(['locked','lockReason','lockedAt','username','usernameLower','uid','createdAt'])
+          && (!('avatar' in request.resource.data) || request.resource.data.avatar.size() < 200000))
+        // the moderator may lock / unlock anyone except themselves
+        || (isAdmin() && request.auth.uid != uid
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['locked','lockReason','lockedAt']));
+      allow delete: if false;
+    }
+
+    match /games/{gid} {
+      allow read: if true;
+      allow create: if notLocked()
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.players == [request.auth.uid]
+        && request.resource.data.status == 'open';
+      allow update: if notLocked()
+        && request.resource.data.createdBy == resource.data.createdBy
+        && (request.auth.uid in resource.data.players
+            || (resource.data.status == 'open'
+                && request.resource.data.status == 'active'
+                && request.resource.data.players.size() == 2
+                && request.auth.uid in request.resource.data.players));
+      allow delete: if isAdmin()
+        || (signedIn() && resource.data.createdBy == request.auth.uid && resource.data.status == 'open');
+    }
+  }
+}
